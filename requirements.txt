@@ -1,0 +1,9 @@
+numpy
+pandas
+opencv-python
+scikit-learn
+matplotlib
+seaborn
+tqdm
+dlib-bin
+# install torch + torchvision separately using the command from https://pytorch.org

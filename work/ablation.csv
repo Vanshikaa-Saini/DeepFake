@@ -1,0 +1,5 @@
+model,acc,precision,recall,f1
+Full (LSTM+Transformer+DDM+landmarks),0.5,0.5,1.0,0.6667
+w/o Transformer encoder,0.4583,0.4667,0.5833,0.5185
+w/o DDM,0.4583,0.4667,0.5833,0.5185
+w/o landmark features,0.5,0.5,1.0,0.6667
