@@ -5,3 +5,8 @@ work/*.pt
 work/*.npz
 work/*.dat
 work/*.bz2
+.venv/
+work/
+work_all/
+*.code-workspace
+*.pth

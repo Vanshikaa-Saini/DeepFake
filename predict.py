@@ -1,3 +1,6 @@
+"""Classify new videos with the trained model.   Usage:  python predict.py video1.mp4 [video2.mp4 ...]
+Needs ./work/full.pt (+ the cached features in ./work) produced by deepfake.py. Run from the same folder as deepfake.py.
+NOTE: faces are found with dlib's detector (the paper uses FastMTCNN) to avoid an extra dependency."""
 import sys, os, re, glob, json, math, random
 import numpy as np, cv2, torch, torch.nn as nn, torch.nn.functional as F, torchvision, dlib
 from sklearn.model_selection import train_test_split
@@ -32,8 +35,24 @@ CFG = dict(
 )
 
 CFG.update(json.loads(os.environ.get("DF_OVERRIDES", "{}")))
-WORK = CFG["WORK_DIR"]
-predictor = dlib.shape_predictor(os.path.join(WORK, "shape_predictor_68_face_landmarks.dat"))
+# ---- command-line options ----
+def _opt(name, default):
+    if name in sys.argv:
+        i = sys.argv.index(name); v = sys.argv[i + 1]; del sys.argv[i:i + 2]; return v
+    return default
+WORK = _opt("--work", "./work_all" if os.path.isdir("./work_all") else "./work")
+MODEL_KEY = _opt("--model", "no_transformer" if os.path.isdir("./work_all") else "full")
+THR_ARG = _opt("--thr", None)
+MODELS = {  # key: (checkpoint, row name in ablation.csv, flags)
+    "full":           ("full.pt", "Full (LSTM+Transformer+DDM+landmarks)", dict(use_landmarks=True, use_transformer=True, use_ddm=True)),
+    "no_transformer": ("w_o_Transformer_encoder.pt", "w/o Transformer encoder", dict(use_landmarks=True, use_transformer=False, use_ddm=True)),
+    "no_ddm":         ("w_o_DDM.pt", "w/o DDM", dict(use_landmarks=True, use_transformer=True, use_ddm=False)),
+    "no_landmarks":   ("w_o_landmark_features.pt", "w/o landmark features", dict(use_landmarks=False, use_transformer=True, use_ddm=True)),
+}
+assert MODEL_KEY in MODELS, f"--model must be one of {list(MODELS)}"
+_lm = os.path.join(WORK, "shape_predictor_68_face_landmarks.dat")
+if not os.path.exists(_lm): _lm = "./work/shape_predictor_68_face_landmarks.dat"
+predictor = dlib.shape_predictor(_lm)
 detector = dlib.get_frontal_face_detector()
 # ---------- frame enhancement (paper Eq.1-4 + NLM + HSV boost) ----------
 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))        # clip/tile ASSUMED (paper gives none)
@@ -147,8 +166,39 @@ trv, te = train_test_split(df, test_size=CFG["TEST_FRAC"], stratify=df.label, ra
 tr, va = train_test_split(trv, test_size=CFG["VAL_FRAC"], stratify=trv.label, random_state=42)
 g_tr = np.concatenate([geo_all[i] for i in tr.index]); G_MEAN, G_STD = g_tr.mean(0), g_tr.std(0) + 1e-6
 
-model = DeepfakeNet().to(DEVICE)
-model.load_state_dict(torch.load(os.path.join(WORK, "full.pt"), map_location=DEVICE)); model.eval()
+_ck, _row, _flags = MODELS[MODEL_KEY]
+model = DeepfakeNet(**_flags).to(DEVICE)
+model.load_state_dict(torch.load(os.path.join(WORK, _ck), map_location=DEVICE)); model.eval()
+THR = 0.5
+if THR_ARG is not None: THR = float(THR_ARG)
+else:
+    try:
+        _abl = pd.read_csv(os.path.join(WORK, "ablation.csv")).set_index("model")
+        if "val_tuned_thr" in _abl.columns and _row in _abl.index: THR = float(_abl.loc[_row, "val_tuned_thr"])
+    except Exception: pass
+print(f"model: {MODEL_KEY} ({WORK}/{_ck}) | decision threshold: {THR:.4f}")
+
+try:
+    from facenet_pytorch import MTCNN
+    _mtcnn = MTCNN(keep_all=True, device="cpu", min_face_size=20, thresholds=[0.6, 0.7, 0.7])   # same detector family as the paper (MTCNN)
+except Exception as e:
+    _mtcnn = None; print("  (MTCNN not available -> using dlib face detector only:", type(e).__name__, ")")
+
+def _find_box(f):
+    """largest face box (x1,y1,x2,y2) in frame coords, or None. MTCNN first, then dlib."""
+    sc = 960 / f.shape[1] if f.shape[1] > 960 else 1.0
+    small = cv2.resize(f, None, fx=sc, fy=sc) if sc != 1.0 else f
+    if _mtcnn is not None:
+        try:
+            boxes, probs = _mtcnn.detect(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+            if boxes is not None and len(boxes):
+                k = int(np.argmax([(float(b[2]) - float(b[0])) * (float(b[3]) - float(b[1])) for b in boxes]))
+                return [float(v) / sc for v in boxes[k]]
+        except Exception: pass
+    rects = detector(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), 1)
+    if len(rects):
+        r = max(rects, key=lambda r: r.area()); return [v / sc for v in (r.left(), r.top(), r.right(), r.bottom())]
+    return None
 
 def crop_faces(path, max_detect=120):
     cap = cv2.VideoCapture(path); n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)); frames = []
@@ -158,16 +208,28 @@ def crop_faces(path, max_detect=120):
         if not ok: break
         if i in want: frames.append(f)
         i += 1
-    cap.release(); faces = []; print(f"  read {len(frames)} frames to search for faces (video has {n} frames)")
+    cap.release(); print(f"  read {len(frames)} frames to search for faces (video has {n} frames)")
+    if not frames: return []
+    os.makedirs(WORK, exist_ok=True); cv2.imwrite(os.path.join(WORK, "debug_frame.jpg"), frames[len(frames) // 2])
+    print("  saved a sample frame to work/debug_frame.jpg - open it to check the face is visible and upright")
+    # pick the rotation that yields the most faces on a few probe frames (handles sideways phone videos)
+    rots = {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180, 270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    probe = frames[:: max(1, len(frames) // 8)]
+    best_rot, best_cnt = 0, -1
+    for deg, code in rots.items():
+        cnt = sum(_find_box(p if code is None else cv2.rotate(p, code)) is not None for p in probe)
+        if cnt > best_cnt: best_rot, best_cnt = deg, cnt
+        if deg == 0 and cnt >= len(probe) // 2: break
+    code = rots[best_rot]
+    if best_rot: print(f"  video looks rotated; using {best_rot} degree rotation")
+    faces = []
     for f in frames:
-        sc = 960 / max(f.shape[1], 1) if f.shape[1] > 960 else 1.0
-        small = cv2.resize(f, None, fx=sc, fy=sc) if sc != 1.0 else f
-        rects = detector(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), 1)
-        if not len(rects): continue
-        r = max(rects, key=lambda r: r.area()); m = 0.15
-        x1, y1 = int((r.left() - m * r.width()) / sc), int((r.top() - m * r.height()) / sc)
-        x2, y2 = int((r.right() + m * r.width()) / sc), int((r.bottom() + m * r.height()) / sc)
-        x1, y1 = max(x1, 0), max(y1, 0); face = f[y1:y2, x1:x2]
+        if code is not None: f = cv2.rotate(f, code)
+        b = _find_box(f)
+        if b is None: continue
+        x1, y1, x2, y2 = b; w, h = x2 - x1, y2 - y1; m = 0.15
+        x1, y1, x2, y2 = [max(int(v), 0) for v in (x1 - m * w, y1 - m * h, x2 + m * w, y2 + m * h)]
+        face = f[y1:y2, x1:x2]
         if face.size and min(face.shape[:2]) > 20: faces.append(face)
     return faces
 
@@ -193,4 +255,4 @@ if __name__ == "__main__":
     for p in paths:
         pr, n = predict(p)
         if pr is None: print(f"{os.path.basename(p)}: no usable face found ({n} faces detected)"); continue
-        print(f"{os.path.basename(p)}: P(fake) = {pr:.3f}  ->  {'FAKE' if pr > 0.5 else 'REAL'}")
+        print(f"{os.path.basename(p)}: P(fake) = {pr:.4f}  (threshold {THR:.4f})  ->  {'FAKE' if pr > THR else 'REAL'}")
